@@ -44,7 +44,7 @@ def main():
     with archive.open("rb") as stream:
         digest = hashlib.file_digest(stream, "sha256").hexdigest()
     archive.with_name(archive.name + ".sha256").write_text(
-        f"{digest}  {archive.name}\n", encoding="utf-8"
+        f"{digest}  {archive.name}\n", encoding="utf-8", newline="\n"
     )
     print(archive)
 
