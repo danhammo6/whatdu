@@ -16,7 +16,8 @@ class Browser:
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
             os.environ["TERM"] = "xterm-256color"
-            os.execv("./target/release/whatdu", ["whatdu", str(path)])
+            binary = os.environ.get("WHATDU_BIN", "./target/release/whatdu")
+            os.execv(binary, ["whatdu", str(path)])
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 160, 0, 0))
         self.output = b""
         self.pump(1)

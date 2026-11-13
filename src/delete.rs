@@ -1,4 +1,7 @@
-use crate::scan::{file_identity, Node};
+use crate::{
+    platform,
+    scan::{file_identity, Node},
+};
 use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
 use std::{
@@ -78,7 +81,7 @@ fn validate_target(root: &Node, target: &Node) -> Result<()> {
     {
         bail!("refusing to delete the scan root or an unsafe path");
     }
-    let root_metadata = fs::symlink_metadata(&root.path)?;
+    let root_metadata = platform::metadata(&root.path)?;
     if !root_metadata.is_dir() || file_identity(&root_metadata) != root.deletion_identity {
         bail!("scan root changed; restart whatdu before deleting");
     }
@@ -88,10 +91,10 @@ fn validate_target(root: &Node, target: &Node) -> Result<()> {
     if actual_parent != expected_parent {
         bail!("parent path changed or traverses a symlink; restart whatdu before deleting");
     }
-    let metadata = fs::symlink_metadata(&target.path)?;
+    let metadata = platform::metadata(&target.path)?;
     if file_identity(&metadata) != target.deletion_identity
         || metadata.is_dir() != target.is_dir
-        || metadata.file_type().is_symlink() != target.is_symlink
+        || metadata.is_symlink() != target.is_symlink
     {
         bail!("selected entry changed since scanning; restart whatdu before deleting");
     }
@@ -100,7 +103,7 @@ fn validate_target(root: &Node, target: &Node) -> Result<()> {
 
 fn plan(path: &Path, device: Option<u64>, progress: &Progress) -> Result<Entry> {
     progress.check_cancel()?;
-    let metadata = fs::symlink_metadata(path)?;
+    let metadata = platform::metadata(path)?;
     if file_identity(&metadata).map(|id| id.0) != device {
         bail!(
             "refusing deletion across a filesystem boundary: {}",
@@ -123,18 +126,18 @@ fn plan(path: &Path, device: Option<u64>, progress: &Progress) -> Result<Entry> 
         path: path.to_path_buf(),
         identity: file_identity(&metadata),
         is_dir: metadata.is_dir(),
-        is_symlink: metadata.file_type().is_symlink(),
+        is_symlink: metadata.is_symlink(),
         children,
     })
 }
 
 fn remove_entry(entry: &Entry, progress: &Progress) -> Result<()> {
     progress.check_cancel()?;
-    let metadata = fs::symlink_metadata(&entry.path)?;
+    let metadata = platform::metadata(&entry.path)?;
     anyhow::ensure!(
         file_identity(&metadata) == entry.identity
             && metadata.is_dir() == entry.is_dir
-            && metadata.file_type().is_symlink() == entry.is_symlink,
+            && metadata.is_symlink() == entry.is_symlink,
         "entry changed during deletion: {}",
         entry.path.display()
     );
@@ -147,7 +150,7 @@ fn remove_entry(entry: &Entry, progress: &Progress) -> Result<()> {
         fs::remove_dir(&entry.path)
             .with_context(|| format!("cannot remove directory {}", entry.path.display()))?;
     } else {
-        fs::remove_file(&entry.path)
+        platform::unlink(&entry.path, &metadata)
             .with_context(|| format!("cannot remove file {}", entry.path.display()))?;
     }
     // Sum pre-removal entry sizes, not reclaimed filesystem capacity.
@@ -210,7 +213,7 @@ mod tests {
         let path = temp.path().join("file");
         fs::write(&path, b"safe").unwrap();
         let root = snapshot(temp.path());
-        let actual_device = file_identity(&fs::symlink_metadata(&path).unwrap()).map(|id| id.0);
+        let actual_device = file_identity(&platform::metadata(&path).unwrap()).map(|id| id.0);
         let other_device = Some(actual_device.unwrap_or(0).wrapping_add(1));
         assert!(plan(&path, other_device, &Progress::default()).is_err());
         assert!(path.exists());
@@ -304,7 +307,7 @@ mod tests {
         fs::write(&path, vec![b'x'; 8192]).unwrap();
         fs::hard_link(&path, temp.path().join("keep")).unwrap();
         let root = snapshot(temp.path());
-        let bytes = crate::scan::allocated(&fs::symlink_metadata(&path).unwrap());
+        let bytes = crate::scan::allocated(&platform::metadata(&path).unwrap());
         let progress = Progress::default();
         remove_parallel(&root, &root.children[0], 4, &progress).unwrap();
         assert_eq!(progress.removed_allocated.load(Ordering::Relaxed), bytes);
@@ -320,7 +323,7 @@ mod tests {
         fs::write(temp.path().join("a"), b"test").unwrap();
         fs::write(temp.path().join("b"), b"test").unwrap();
         let progress = Progress::default();
-        let device = file_identity(&fs::symlink_metadata(temp.path()).unwrap()).map(|id| id.0);
+        let device = file_identity(&platform::metadata(temp.path()).unwrap()).map(|id| id.0);
         let entry = plan(temp.path(), device, &progress).unwrap();
         remove_entry(&entry.children[0], &progress).unwrap();
         progress.cancel.store(true, Ordering::Relaxed);
@@ -328,7 +331,6 @@ mod tests {
         assert_eq!(progress.removed.load(Ordering::Relaxed), 1);
         assert!(entry.children[1].path.exists());
         assert!(temp.path().exists());
-        #[cfg(unix)]
         {
             progress.cancel.store(false, Ordering::Relaxed);
             let original = &entry.children[1].path;
@@ -338,5 +340,93 @@ mod tests {
             assert!(original.exists());
             assert_eq!(progress.removed.load(Ordering::Relaxed), 1);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn junction_deletion_never_removes_target_contents() {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("keep"), b"safe").unwrap();
+        fs::create_dir(temp.path().join("nested")).unwrap();
+        crate::platform::test_support::junction(&temp.path().join("link"), outside.path());
+        crate::platform::test_support::junction(&temp.path().join("nested/link"), outside.path());
+        let root = snapshot(temp.path());
+        assert_eq!(root.errors, 0);
+        for child in &root.children {
+            remove(&root, child).unwrap();
+        }
+        assert_eq!(fs::read(outside.path().join("keep")).unwrap(), b"safe");
+        assert_eq!(snapshot(temp.path()).items, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_directory_and_dangling_symlinks_are_unlinked() {
+        use std::os::windows::fs::{symlink_dir, symlink_file};
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("keep"), b"safe").unwrap();
+        symlink_dir(outside.path(), temp.path().join("directory link")).unwrap();
+        symlink_file("missing", temp.path().join("dangling file link")).unwrap();
+        symlink_dir("missing", temp.path().join("dangling directory link")).unwrap();
+        let root = snapshot(temp.path());
+        assert_eq!(root.errors, 0);
+        for child in &root.children {
+            assert!(child.is_symlink);
+            assert!(child.children.is_empty());
+            remove(&root, child).unwrap();
+        }
+        assert_eq!(fs::read(outside.path().join("keep")).unwrap(), b"safe");
+        assert_eq!(snapshot(temp.path()).items, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn refuses_replaced_file_and_junction_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("dir")).unwrap();
+        fs::write(temp.path().join("dir/file"), b"original").unwrap();
+        let root = snapshot(temp.path());
+        let target = &root.children[0].children[0];
+        fs::rename(&target.path, temp.path().join("dir/saved")).unwrap();
+        fs::write(&target.path, b"replacement").unwrap();
+        assert!(remove(&root, target).is_err());
+        assert_eq!(fs::read(&target.path).unwrap(), b"replacement");
+        fs::rename(temp.path().join("dir"), temp.path().join("moved")).unwrap();
+        crate::platform::test_support::junction(
+            &temp.path().join("dir"),
+            &temp.path().join("moved"),
+        );
+        assert!(remove(&root, target).is_err());
+        assert_eq!(
+            fs::read(temp.path().join("moved/saved")).unwrap(),
+            b"original"
+        );
+        fs::remove_dir(temp.path().join("dir")).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn locked_and_readonly_files_fail_without_deleting() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("keep");
+        fs::write(&path, b"safe").unwrap();
+        let root = snapshot(temp.path());
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        assert!(remove(&root, &root.children[0]).is_err());
+        drop(lock);
+        let original = fs::metadata(&path).unwrap().permissions();
+        let mut readonly = original.clone();
+        readonly.set_readonly(true);
+        fs::set_permissions(&path, readonly).unwrap();
+        assert!(remove(&root, &root.children[0]).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"safe");
+        fs::set_permissions(&path, original).unwrap();
     }
 }

@@ -1,5 +1,6 @@
 # Rust build output. Keep Cargo.lock tracked for reproducible CLI builds.
 /target/
+/dist/
 
 # Local IDE settings and editor temporary files.
 .idea/

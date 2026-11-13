@@ -32,6 +32,7 @@ fn json_export_and_worker_counts_agree() {
     assert_eq!(tree["errors"], 0);
 }
 
+#[cfg(unix)]
 #[test]
 fn piped_output_is_plain_text_and_escapes_controls() {
     let temp = tempfile::tempdir().unwrap();
@@ -101,4 +102,16 @@ fn logical_size_can_exceed_disk_capacity_without_claiming_disk_usage() {
         assert!(text.contains("1.0 TiB"));
         assert!(text.contains("sparse"));
     }
+}
+
+#[test]
+fn piped_output_handles_spaces_and_unicode() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("space and café.txt"), b"abc").unwrap();
+    let output = command().arg(temp.path()).output().unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("space and café.txt"));
+    assert!(text.contains("total:"));
+    assert!(!text.contains('\x1b'));
 }

@@ -1,8 +1,9 @@
+use crate::platform::{self, Metadata};
 use rayon::prelude::*;
 use serde::Serialize;
 use std::{
     collections::HashSet,
-    fs::{self, Metadata},
+    fs,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -66,21 +67,13 @@ pub struct Progress {
 
 impl Progress {
     fn record_allocated(&self, metadata: &Metadata, count_links: bool) {
-        #[cfg(unix)]
-        if !count_links && !metadata.is_dir() {
-            use std::os::unix::fs::MetadataExt;
-            if metadata.nlink() > 1
-                && !self
-                    .seen_links
-                    .lock()
-                    .unwrap()
-                    .insert((metadata.dev(), metadata.ino()))
-            {
-                return;
-            }
+        if !count_links
+            && !metadata.is_dir()
+            && metadata.links() > 1
+            && !self.seen_links.lock().unwrap().insert(metadata.identity())
+        {
+            return;
         }
-        #[cfg(not(unix))]
-        let _ = count_links;
         self.allocated
             .fetch_add(allocated(metadata), Ordering::Relaxed);
     }
@@ -93,7 +86,7 @@ pub struct Options {
 }
 
 pub fn scan(path: &Path, options: &Options, progress: &Progress) -> anyhow::Result<Node> {
-    let metadata = fs::symlink_metadata(path)?;
+    let metadata = platform::metadata(path)?;
     let root_device = device(&metadata);
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(options.threads)
@@ -122,7 +115,7 @@ fn visit(path: PathBuf, options: &Options, root_device: u64, progress: &Progress
         own_allocated: 0,
         own_errors: 0,
     };
-    let metadata = match fs::symlink_metadata(&node.path) {
+    let metadata = match platform::metadata(&node.path) {
         Ok(metadata) => metadata,
         Err(error) => {
             record_error(&mut node, error, progress);
@@ -130,7 +123,7 @@ fn visit(path: PathBuf, options: &Options, root_device: u64, progress: &Progress
         }
     };
     node.is_dir = metadata.is_dir();
-    node.is_symlink = metadata.file_type().is_symlink();
+    node.is_symlink = metadata.is_symlink();
     node.deletion_identity = file_identity(&metadata);
     if options.one_file_system && device(&metadata) != root_device {
         return node;
@@ -201,7 +194,7 @@ pub fn rescan(
     progress: &Progress,
 ) -> anyhow::Result<()> {
     path.strip_prefix(&root.path)?;
-    let root_metadata = fs::symlink_metadata(&root.path)?;
+    let root_metadata = platform::metadata(&root.path)?;
     if path != root.path {
         anyhow::ensure!(
             file_identity(&root_metadata) == root.deletion_identity,
@@ -215,7 +208,7 @@ pub fn rescan(
         );
     }
     // Validate first so a vanished directory leaves the existing snapshot intact.
-    fs::symlink_metadata(path)?;
+    platform::metadata(path)?;
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(options.threads)
         .build()?;
@@ -247,7 +240,7 @@ pub fn update_after_delete(
         !relative.as_os_str().is_empty(),
         "cannot update deletion of scan root"
     );
-    let root_metadata = fs::symlink_metadata(&root.path)?;
+    let root_metadata = platform::metadata(&root.path)?;
     anyhow::ensure!(
         file_identity(&root_metadata) == root.deletion_identity,
         "scan root changed"
@@ -260,7 +253,7 @@ pub fn update_after_delete(
             fs::canonicalize(path.parent().unwrap())? == expected_parent,
             "parent path changed"
         );
-        match fs::symlink_metadata(path) {
+        match platform::metadata(path) {
             Ok(_) => {
                 let pool = rayon::ThreadPoolBuilder::new()
                     .num_threads(options.threads)
@@ -301,7 +294,7 @@ fn replace_entry(node: &mut Node, path: &Path, replacement: Option<Node>) {
     } else {
         replace_entry(&mut node.children[index], path, replacement);
     }
-    if let Ok(metadata) = fs::symlink_metadata(&node.path) {
+    if let Ok(metadata) = platform::metadata(&node.path) {
         if file_identity(&metadata) == node.deletion_identity {
             node.own_apparent = metadata.len();
             node.own_allocated = allocated(&metadata);
@@ -309,37 +302,16 @@ fn replace_entry(node: &mut Node, path: &Path, replacement: Option<Node>) {
     }
 }
 
-#[cfg(unix)]
 fn device(metadata: &Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    metadata.dev()
+    metadata.identity().0
 }
 
-#[cfg(not(unix))]
-fn device(_: &Metadata) -> u64 {
-    0
-}
-
-#[cfg(unix)]
 pub fn file_identity(metadata: &Metadata) -> Option<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-    Some((metadata.dev(), metadata.ino()))
+    Some(metadata.identity())
 }
 
-#[cfg(not(unix))]
-pub fn file_identity(_: &Metadata) -> Option<(u64, u64)> {
-    None
-}
-
-#[cfg(unix)]
 pub(crate) fn allocated(metadata: &Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    metadata.blocks().saturating_mul(512)
-}
-
-#[cfg(not(unix))]
-pub(crate) fn allocated(metadata: &Metadata) -> u64 {
-    metadata.len()
+    metadata.allocated()
 }
 
 #[cfg(test)]
@@ -392,7 +364,6 @@ mod tests {
         .is_err());
     }
 
-    #[cfg(unix)]
     #[test]
     fn hard_links_are_counted_once_unless_requested() {
         let temp = tempfile::tempdir().unwrap();
@@ -616,5 +587,78 @@ mod tests {
         rescan(&mut root, &dir, &options(false), &Progress::default()).unwrap();
         assert_eq!(root.children[0].children[0].apparent, 5);
         assert_eq!(root.children[1].apparent, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn junctions_and_junction_roots_are_not_followed() {
+        let temp = tempfile::tempdir().unwrap();
+        let link = temp.path().join("junction cycle");
+        crate::platform::test_support::junction(&link, temp.path());
+        let root = run(temp.path(), 4, false);
+        assert_eq!(root.errors, 0);
+        assert_eq!(root.items, 1);
+        assert!(root.children[0].is_symlink);
+        assert!(!root.children[0].is_dir);
+        assert!(root.children[0].children.is_empty());
+        let link_root = run(&link, 2, false);
+        assert!(link_root.is_symlink);
+        assert_eq!(link_root.items, 0);
+        fs::remove_dir(link).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_sparse_allocation_and_long_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut directory = temp.path().to_path_buf();
+        for _ in 0..16 {
+            directory.push("long directory café");
+        }
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("sparse file");
+        crate::platform::test_support::sparse(&path, 1 << 40);
+        let node = run(&path, 2, false);
+        assert_eq!(node.errors, 0);
+        assert_eq!(node.apparent, 1 << 40);
+        assert!(node.allocated < node.apparent);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_compressed_files_use_compressed_allocation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("compressed");
+        fs::write(&path, vec![b'x'; 1024 * 1024]).unwrap();
+        let output = std::process::Command::new("compact")
+            .args(["/C", "/Q"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "compression failed: {output:?}");
+        let node = run(&path, 2, false);
+        assert_eq!(node.errors, 0);
+        assert_eq!(node.apparent, 1024 * 1024);
+        assert!(node.allocated > 0);
+        assert!(node.allocated < node.apparent);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn locked_files_are_reported_as_scan_errors() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("locked");
+        fs::write(&path, b"test").unwrap();
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let node = run(temp.path(), 2, false);
+        assert_eq!(node.errors, 1);
+        assert!(node.children[0].error.is_some());
+        drop(lock);
+        assert_eq!(run(temp.path(), 2, false).errors, 0);
     }
 }

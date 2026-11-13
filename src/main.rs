@@ -1,4 +1,5 @@
 mod delete;
+mod platform;
 mod scan;
 mod ui;
 
@@ -22,10 +23,10 @@ struct Args {
     /// Display logical file lengths instead of allocated disk space
     #[arg(short = 'a', long)]
     apparent_size: bool,
-    /// Do not cross filesystem boundaries (Unix only)
+    /// Do not cross filesystem boundaries
     #[arg(short = 'x', long)]
     one_file_system: bool,
-    /// Count each hard link separately instead of deduplicating (Unix only)
+    /// Count each hard link separately instead of deduplicating
     #[arg(long)]
     count_links: bool,
     /// Print immediate children, without opening the interactive browser
