@@ -1,0 +1,23 @@
+# Rust build output. Keep Cargo.lock tracked for reproducible CLI builds.
+/target/
+
+# Local IDE settings and editor temporary files.
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS metadata.
+.DS_Store
+._*
+
+# Python cache files from terminal integration tests.
+__pycache__/
+*.py[cod]
+
+# Local environment configuration and disk-usage exports.
+.env
+.env.*
+!.env.example
+/usage.json
