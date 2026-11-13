@@ -24,7 +24,8 @@ Download `.tar.gz` (macOS/Linux) or `.zip` (Windows) archives from
 contains the executable, this README, and the MIT license. Run `whatdu.exe`
 in a Windows terminal, or `./whatdu` on macOS/Linux after extraction.
 Linux binaries are built on Ubuntu 22.04; use a distribution with glibc 2.35
-or newer. macOS binaries target macOS 11 or newer.
+or newer. macOS binaries target macOS 11 or newer. The Windows executable
+statically links the C runtime and needs no Visual C++ redistributable.
 
 Releases include `SHA256SUMS`. On macOS verify a downloaded archive with
 `shasum -a 256 <archive>`; on Linux use `sha256sum <archive>`; on Windows use

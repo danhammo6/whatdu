@@ -67,6 +67,10 @@ jobs:
         run: cargo build --locked --release --target "$RUST_TARGET"
         env:
           RUST_TARGET: ${{ matrix.target }}
+      - name: Smoke-test release executable
+        run: python -c 'import os, subprocess; exe = "whatdu.exe" if os.name == "nt" else "whatdu"; subprocess.run(["target/" + os.environ["RUST_TARGET"] + "/release/" + exe, "--version"], check=True)'
+        env:
+          RUST_TARGET: ${{ matrix.target }}
       - name: Terminal interaction tests (Unix PTY)
         if: runner.os != 'Windows'
         run: python tests/tui_delete.py
