@@ -10,6 +10,8 @@ pub struct Metadata {
     link: bool,
     #[cfg(windows)]
     directory_link: bool,
+    #[cfg(windows)]
+    readonly: bool,
 }
 
 impl Metadata {
@@ -55,8 +57,18 @@ pub fn metadata(path: &Path) -> io::Result<Metadata> {
 /// Remove only this name. Windows directory links require RemoveDirectory.
 pub fn unlink(path: &Path, metadata: &Metadata) -> io::Result<()> {
     #[cfg(windows)]
-    if metadata.directory_link {
-        return fs::remove_dir(path);
+    {
+        // std::fs::remove_file may bypass the Windows read-only attribute.
+        // Preserve it rather than implicitly opting into that behavior.
+        if metadata.readonly {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "file is read-only",
+            ));
+        }
+        if metadata.directory_link {
+            return fs::remove_dir(path);
+        }
     }
     let _ = metadata;
     fs::remove_file(path)
@@ -78,10 +90,11 @@ mod windows {
     use windows_sys::Win32::Storage::FileSystem::{
         FileAttributeTagInfo, FileCompressionInfo, FileStandardInfo, GetFileInformationByHandle,
         GetFileInformationByHandleEx, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_COMPRESSED,
-        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_SPARSE_FILE,
-        FILE_ATTRIBUTE_TAG_INFO, FILE_COMPRESSION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_INFO_BY_HANDLE_CLASS, FILE_READ_ATTRIBUTES,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_ATTRIBUTE_SPARSE_FILE, FILE_ATTRIBUTE_TAG_INFO, FILE_COMPRESSION_INFO,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_INFO_BY_HANDLE_CLASS,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_STANDARD_INFO,
     };
 
     // Name-surrogate reparse tags redirect paths (symlinks, junctions, mount points).
@@ -152,6 +165,7 @@ mod windows {
             directory: directory && !link,
             link,
             directory_link: directory && link,
+            readonly: attributes & FILE_ATTRIBUTE_READONLY != 0,
         })
     }
 }
@@ -163,10 +177,13 @@ pub mod test_support {
     use windows_sys::Win32::System::{Ioctl::FSCTL_SET_SPARSE, IO::DeviceIoControl};
 
     pub fn junction(link: &Path, target: &Path) {
+        // cmd's mklink parses forward slashes as switches, unlike Rust's file APIs.
+        let link: std::path::PathBuf = link.components().collect();
+        let target: std::path::PathBuf = target.components().collect();
         let output = Command::new("cmd")
             .args(["/C", "mklink", "/J"])
-            .arg(link)
-            .arg(target)
+            .arg(&link)
+            .arg(&target)
             .output()
             .unwrap();
         assert!(

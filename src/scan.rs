@@ -645,7 +645,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn locked_files_are_reported_as_scan_errors() {
+    fn metadata_only_scan_can_inspect_locked_file() {
         use std::os::windows::fs::OpenOptionsExt;
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("locked");
@@ -656,8 +656,9 @@ mod tests {
             .open(&path)
             .unwrap();
         let node = run(temp.path(), 2, false);
-        assert_eq!(node.errors, 1);
-        assert!(node.children[0].error.is_some());
+        assert_eq!(node.errors, 0);
+        assert_eq!(node.children[0].apparent, 4);
+        assert!(node.children[0].error.is_none());
         drop(lock);
         assert_eq!(run(temp.path(), 2, false).errors, 0);
     }
