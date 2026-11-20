@@ -41,6 +41,7 @@ Successful builds are downloadable from the workflow's **Artifacts** section
 for 14 days. Pushing a `v*` tag publishes release archives and checksums only
 after every platform passes. Tag names must match the package version, for
 example `v0.1.0` for `version = "0.1.0"` in `Cargo.toml`.
+See [Releasing](#releasing) for the maintainer checklist.
 
 ## Build and run
 
@@ -205,3 +206,31 @@ To run the PTY tests against a binary in a different location, set `WHATDU_BIN`.
 For example, `WHATDU_BIN=./target/aarch64-apple-darwin/release/whatdu python3 tests/tui_delete.py`.
 Release packaging uses Python 3.11 or newer: after building with an explicit
 `--target`, run `python3 scripts/package.py --target <target>`.
+
+## Releasing
+
+1. Update the package version in `Cargo.toml` and run `cargo check` to refresh
+   `Cargo.lock`. For example, use `0.1.2` for the next patch release after `0.1.1`.
+2. Commit both version files with the release changes and merge the passing
+   branch into `main`.
+3. With Git configured for SSH signing and your agent available through
+   `SSH_AUTH_SOCK`, create and push a signed tag matching the package version:
+
+   ```sh
+   git switch main
+   git pull --ff-only origin main
+   git tag -s v0.1.2 -m "whatdu v0.1.2"
+   git push --atomic origin main v0.1.2
+   ```
+
+GitHub verifies that the tag matches `Cargo.toml`, then runs formatting, Clippy,
+unit and CLI tests, release builds, and executable smoke tests on all four native
+targets. macOS and Linux also run the interactive terminal tests. After every
+platform passes, GitHub publishes the four binary archives, generated release
+notes, and `SHA256SUMS` to [GitHub Releases](https://github.com/danhammo6/whatdu/releases).
+
+Checksum files must use LF line endings on every platform so the Linux release
+publisher can verify Windows archives. This was corrected in the first published
+release, [v0.1.1](https://github.com/danhammo6/whatdu/releases/tag/v0.1.1).
+If a release attempt exposes a bug, fix it and cut a new patch version; preserve
+existing public tags.
